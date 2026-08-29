@@ -1,0 +1,366 @@
+import asyncio
+import time
+import discord
+import aiosqlite
+from discord.ext import commands
+from discord import app_commands
+
+TOKEN = "MTUyNTMyNzQ3NjAzNTgxMzUxNg.G088HN.HMZ0j1GeNcYbF104Bt_HpiLLZuihsi8wWZEwsI"
+
+intents = discord.Intents.all()
+bot = commands.Bot(command_prefix="z", intents=intents)
+
+# ---------------- DATABASE ----------------
+
+async def setup_db():
+    async with aiosqlite.connect("security.db") as db:
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS settings(
+            guild_id INTEGER PRIMARY KEY,
+            log_channel INTEGER,
+            anti_spam INTEGER DEFAULT 1,
+            anti_invite INTEGER DEFAULT 1,
+            anti_raid INTEGER DEFAULT 1
+        )
+        """)
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS whitelist(
+            guild_id INTEGER,
+            user_id INTEGER,
+            PRIMARY KEY(guild_id,user_id)
+        )
+        """)
+        await db.commit()
+
+async def get_settings(guild_id):
+    async with aiosqlite.connect("security.db") as db:
+        cur = await db.execute(
+            "SELECT * FROM settings WHERE guild_id=?", (guild_id,)
+        )
+        row = await cur.fetchone()
+
+        if not row:
+            await db.execute(
+                "INSERT INTO settings(guild_id) VALUES(?)", (guild_id,)
+            )
+            await db.commit()
+            return {"log_channel": None, "anti_spam": 1, "anti_invite": 1, "anti_raid": 1}
+
+        return {
+            "log_channel": row[1],
+            "anti_spam": row[2],
+            "anti_invite": row[3],
+            "anti_raid": row[4]
+        }
+
+async def is_whitelisted(guild_id, user_id):
+    async with aiosqlite.connect("security.db") as db:
+        cur = await db.execute(
+            "SELECT 1 FROM whitelist WHERE guild_id=? AND user_id=?",
+            (guild_id, user_id)
+        )
+        return await cur.fetchone() is not None
+
+# ---------------- READY ----------------
+
+@bot.event
+async def on_ready():
+    await setup_db()
+    await bot.tree.sync()
+    print(f"Logged in as {bot.user}")
+
+# ---------------- LOGGING ----------------
+
+async def log(guild, title, description, color=discord.Color.red()):
+    s = await get_settings(guild.id)
+    if not s["log_channel"]:
+        return
+
+    channel = guild.get_channel(s["log_channel"])
+    if channel:
+        embed = discord.Embed(
+            title=title,
+            description=description,
+            color=color
+        )
+        embed.timestamp = discord.utils.utcnow()
+        await channel.send(embed=embed)
+
+# ---------------- SPAM ----------------
+
+message_cache = {}
+
+@bot.event
+async def on_message(message):
+
+    if message.author.bot or not message.guild:
+        return
+
+    s = await get_settings(message.guild.id)
+
+    # Anti Invite
+    if s["anti_invite"]:
+        if "discord.gg/" in message.content.lower():
+            try:
+                await message.delete()
+                await message.author.timeout(
+                    discord.utils.utcnow() + discord.utils.timedelta(minutes=10),
+                    reason="Discord Invite"
+                )
+                await log(
+                    message.guild,
+                    "Invite Blocked",
+                    f"{message.author.mention} posted an invite."
+                )
+            except:
+                pass
+
+    # Anti Spam
+    if s["anti_spam"]:
+        now = time.time()
+
+        cache = message_cache.setdefault(message.author.id, [])
+        cache.append(now)
+
+        cache[:] = [x for x in cache if now - x < 5]
+
+        if len(cache) >= 6:
+            try:
+                await message.author.timeout(
+                    discord.utils.utcnow() + discord.utils.timedelta(minutes=5),
+                    reason="Spam"
+                )
+                await log(
+                    message.guild,
+                    "Spam Detected",
+                    f"{message.author.mention} was timed out."
+                )
+                cache.clear()
+            except:
+                pass
+
+    await bot.process_commands(message)
+
+# ---------------- RAID ----------------
+
+joins = {}
+
+@bot.event
+async def on_member_join(member):
+
+    s = await get_settings(member.guild.id)
+
+    if not s["anti_raid"]:
+        return
+
+    now = time.time()
+    cache = joins.setdefault(member.guild.id, [])
+    cache.append(now)
+
+    cache[:] = [x for x in cache if now - x < 10]
+
+    if len(cache) >= 8:
+        await log(
+            member.guild,
+            "Raid Alert",
+            "More than 8 members joined in 10 seconds.",
+            discord.Color.orange()
+        )
+
+# ---------------- ANTI CHANNEL DELETE ----------------
+
+@bot.event
+async def on_guild_channel_delete(channel):
+
+    guild = channel.guild
+
+    async for entry in guild.audit_logs(
+            limit=1,
+            action=discord.AuditLogAction.channel_delete):
+
+        if await is_whitelisted(guild.id, entry.user.id):
+            return
+
+        try:
+            await entry.user.timeout(
+                discord.utils.utcnow() + discord.utils.timedelta(hours=1),
+                reason="Channel Deletion Protection"
+            )
+
+            await log(
+                guild,
+                "Channel Protection",
+                f"{entry.user.mention} deleted **{channel.name}**."
+            )
+        except:
+            pass
+
+# ---------------- ANTI ROLE DELETE ----------------
+
+@bot.event
+async def on_guild_role_delete(role):
+
+    guild = role.guild
+
+    async for entry in guild.audit_logs(
+            limit=1,
+            action=discord.AuditLogAction.role_delete):
+
+        if await is_whitelisted(guild.id, entry.user.id):
+            return
+
+        try:
+            await entry.user.timeout(
+                discord.utils.utcnow() + discord.utils.timedelta(hours=1),
+                reason="Role Deletion Protection"
+            )
+
+            await log(
+                guild,
+                "Role Protection",
+                f"{entry.user.mention} deleted **{role.name}**."
+            )
+        except:
+            pass
+
+# ---------------- MASS BAN DETECTION ----------------
+
+ban_tracker = {}
+
+@bot.event
+async def on_member_ban(guild, user):
+
+    async for entry in guild.audit_logs(
+            limit=1,
+            action=discord.AuditLogAction.ban):
+
+        if await is_whitelisted(guild.id, entry.user.id):
+            return
+
+        now = time.time()
+        cache = ban_tracker.setdefault(entry.user.id, [])
+        cache.append(now)
+
+        cache[:] = [x for x in cache if now - x < 20]
+
+        if len(cache) >= 3:
+            try:
+                await entry.user.timeout(
+                    discord.utils.utcnow() + discord.utils.timedelta(hours=2),
+                    reason="Mass Ban Protection"
+                )
+
+                await log(
+                    guild,
+                    "Mass Ban Blocked",
+                    f"{entry.user.mention} exceeded ban threshold."
+                )
+            except:
+                pass
+
+# ---------------- SLASH COMMANDS ----------------
+
+security = app_commands.Group(
+    name="security",
+    description="Security commands"
+)
+
+@security.command(name="setlog")
+@app_commands.checks.has_permissions(administrator=True)
+async def setlog(interaction, channel: discord.TextChannel):
+
+    async with aiosqlite.connect("security.db") as db:
+        await db.execute("""
+        INSERT INTO settings(guild_id,log_channel)
+        VALUES(?,?)
+        ON CONFLICT(guild_id)
+        DO UPDATE SET log_channel=excluded.log_channel
+        """, (interaction.guild.id, channel.id))
+        await db.commit()
+
+    await interaction.response.send_message(
+        f"Log channel set to {channel.mention}"
+    )
+
+@security.command(name="status")
+async def status(interaction):
+
+    s = await get_settings(interaction.guild.id)
+
+    embed = discord.Embed(
+        title="Security Status",
+        color=discord.Color.green()
+    )
+
+    embed.add_field(name="Anti Spam", value="ON" if s["anti_spam"] else "OFF")
+    embed.add_field(name="Anti Invite", value="ON" if s["anti_invite"] else "OFF")
+    embed.add_field(name="Anti Raid", value="ON" if s["anti_raid"] else "OFF")
+
+    await interaction.response.send_message(embed=embed)
+
+@security.command(name="lockdown")
+@app_commands.checks.has_permissions(administrator=True)
+async def lockdown(interaction):
+
+    for channel in interaction.guild.text_channels:
+        try:
+            await channel.set_permissions(
+                interaction.guild.default_role,
+                send_messages=False
+            )
+        except:
+            pass
+
+    await log(
+        interaction.guild,
+        "LOCKDOWN",
+        f"Activated by {interaction.user.mention}",
+        discord.Color.dark_red()
+    )
+
+    await interaction.response.send_message(
+        "Server locked down."
+    )
+
+bot.tree.add_command(security)
+
+# ---------------- WHITELIST ----------------
+
+wl = app_commands.Group(
+    name="whitelist",
+    description="Whitelist management"
+)
+
+@wl.command(name="add")
+@app_commands.checks.has_permissions(administrator=True)
+async def add(interaction, member: discord.Member):
+
+    async with aiosqlite.connect("security.db") as db:
+        await db.execute(
+            "INSERT OR IGNORE INTO whitelist VALUES(?,?)",
+            (interaction.guild.id, member.id)
+        )
+        await db.commit()
+
+    await interaction.response.send_message(
+        f"{member.mention} added to whitelist."
+    )
+
+@wl.command(name="remove")
+@app_commands.checks.has_permissions(administrator=True)
+async def remove(interaction, member: discord.Member):
+
+    async with aiosqlite.connect("security.db") as db:
+        await db.execute(
+            "DELETE FROM whitelist WHERE guild_id=? AND user_id=?",
+            (interaction.guild.id, member.id)
+        )
+        await db.commit()
+
+    await interaction.response.send_message(
+        f"{member.mention} removed."
+    )
+
+bot.tree.add_command(wl)
+
+bot.run(TOKEN)
